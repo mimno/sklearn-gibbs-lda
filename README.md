@@ -49,7 +49,7 @@ for topic_idx, topic in enumerate(lda.components_):
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `n_components` | int | 10 | Number of topics |
-| `doc_topic_prior` | float | None | Alpha prior (default: 1/n_components) |
+| `doc_topic_prior` | float | None | Initial alpha prior (default: 1/n_components) |
 | `topic_word_prior` | float | None | Beta prior (default: 1/n_components) |
 | `max_iter` | int | 100 | Number of Gibbs sampling iterations |
 | `random_state` | int | None | Random seed for reproducibility |
@@ -57,6 +57,8 @@ for topic_idx, topic in enumerate(lda.components_):
 | `burn_in` | int | 50 | Iterations before collecting samples |
 | `sample_every` | int | 5 | Sample collection interval |
 | `n_samples` | int | 10 | Number of samples to average |
+| `optimize_doc_topic_prior` | bool | True | Learn asymmetric alpha from data |
+| `doc_topic_prior_optimize_interval` | int | 10 | Optimize alpha every N iterations |
 
 ### Attributes (after fitting)
 
@@ -66,7 +68,7 @@ for topic_idx, topic in enumerate(lda.components_):
 | `n_features_in_` | int | Vocabulary size |
 | `n_iter_` | int | Iterations completed |
 | `bound_` | float | Final perplexity |
-| `doc_topic_prior_` | float | Effective alpha |
+| `doc_topic_prior_` | (n_components,) | Learned alpha vector (asymmetric) |
 | `topic_word_prior_` | float | Effective beta |
 
 ### Methods
@@ -172,15 +174,26 @@ lda = GibbsLDA(
 )
 ```
 
-### Symmetric vs Asymmetric Priors
+### Alpha Hyperparameter Optimization
+
+By default, GibbsLDA learns an asymmetric alpha (document-topic prior) from the data using fixed-point iteration with digamma functions. This allows some topics to be more prevalent than others.
 
 ```python
-# Sparse topics (low alpha)
-lda = GibbsLDA(n_components=20, doc_topic_prior=0.01)
+# Default: learn asymmetric alpha from data
+lda = GibbsLDA(n_components=20)
+lda.fit(X)
+print(lda.doc_topic_prior_)  # array of learned values per topic
 
-# Dense topics (high alpha)
-lda = GibbsLDA(n_components=20, doc_topic_prior=1.0)
+# Disable optimization (use fixed symmetric alpha)
+lda = GibbsLDA(n_components=20, optimize_doc_topic_prior=False)
+
+# Custom initial alpha (will be optimized unless disabled)
+lda = GibbsLDA(n_components=20, doc_topic_prior=0.1)
 ```
+
+The learned alpha values reveal topic prevalence:
+- High alpha topics appear frequently across documents
+- Low alpha topics are more specialized/rare
 
 ### Working with Sparse Matrices
 
@@ -196,18 +209,28 @@ lda.fit(X_sparse)  # Works directly with sparse matrices
 GibbsLDA uses collapsed Gibbs sampling where topic-word and document-topic distributions are integrated out. Each iteration samples a new topic for every word token:
 
 ```
-p(z = k) ∝ (n_dk + α) × (n_kw + β) / (n_k + Vβ)
+p(z = k) ∝ (n_dk + α_k) × (n_kw + β) / (n_k + Vβ)
 ```
 
 Where:
 - `n_dk` = count of topic k in document d
 - `n_kw` = count of word w in topic k
 - `n_k` = total words assigned to topic k
-- `α` = document-topic prior
+- `α_k` = document-topic prior for topic k (learned)
 - `β` = topic-word prior
 - `V` = vocabulary size
 
 After burn-in, multiple samples are collected and averaged for final estimates.
+
+### Alpha Optimization
+
+The document-topic prior α is optimized using fixed-point iteration (Wallach, Mimno, McCallum, NIPS 2009):
+
+```
+α_k^{new} = α_k × Σ_d[ψ(n_dk + α_k) - ψ(α_k)] / Σ_d[ψ(n_d + Σα) - ψ(Σα)]
+```
+
+This learns an asymmetric prior where each topic can have different prevalence across the corpus.
 
 ## License
 

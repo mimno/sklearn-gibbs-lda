@@ -7,6 +7,7 @@ using collapsed Gibbs sampling instead of variational inference.
 
 import numpy as np
 from scipy.sparse import issparse, csr_matrix
+from scipy.special import psi as digamma
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils import check_random_state
 from sklearn.utils.validation import check_is_fitted, check_array
@@ -42,8 +43,8 @@ def _gibbs_iteration_numba(doc_ids, word_ids, topic_assignments, n_dk, n_kw, n_k
         Topic-word counts.
     n_k : ndarray of shape (n_components,)
         Topic totals.
-    alpha : float
-        Document-topic prior.
+    alpha : ndarray of shape (n_components,)
+        Document-topic prior vector.
     beta : float
         Topic-word prior.
     beta_V : float
@@ -69,7 +70,7 @@ def _gibbs_iteration_numba(doc_ids, word_ids, topic_assignments, n_dk, n_kw, n_k
 
         # Compute unnormalized probabilities
         for k in range(n_components):
-            p[k] = (n_dk[d, k] + alpha) * (n_kw[k, w] + beta) / (n_k[k] + beta_V)
+            p[k] = (n_dk[d, k] + alpha[k]) * (n_kw[k, w] + beta) / (n_k[k] + beta_V)
 
         # Normalize
         p_sum = 0.0
@@ -109,6 +110,80 @@ def _init_counts_numba(doc_ids, word_ids, topic_assignments, n_dk, n_kw, n_k):
 
 
 @jit(nopython=True, cache=True)
+def _optimize_alpha_numba(n_dk, alpha, n_components):
+    """Numba-optimized alpha optimization using histogram method.
+
+    Uses the digamma recurrence relation:
+        ψ(x + n) - ψ(x) = Σ_{i=0}^{n-1} 1/(x + i)
+    """
+    n_docs = n_dk.shape[0]
+
+    # Compute document lengths
+    n_d = np.zeros(n_docs, dtype=np.int32)
+    for d in range(n_docs):
+        for k in range(n_components):
+            n_d[d] += int(n_dk[d, k])
+
+    # Find max document length
+    max_doc_len = 0
+    for d in range(n_docs):
+        if n_d[d] > max_doc_len:
+            max_doc_len = n_d[d]
+    max_doc_len += 1
+
+    # Build document length histogram
+    doc_len_hist = np.zeros(max_doc_len, dtype=np.int32)
+    for d in range(n_docs):
+        doc_len_hist[n_d[d]] += 1
+
+    # Sum of alpha
+    alpha_sum = 0.0
+    for k in range(n_components):
+        alpha_sum += alpha[k]
+
+    # Compute denominator using recurrence relation
+    denom = 0.0
+    current_digamma_diff = 0.0
+    for length in range(1, max_doc_len):
+        current_digamma_diff += 1.0 / (alpha_sum + length - 1)
+        denom += doc_len_hist[length] * current_digamma_diff
+
+    if denom < 1e-10:
+        return
+
+    # Update each alpha_k
+    for k in range(n_components):
+        # Find max count for topic k
+        max_count = 0
+        for d in range(n_docs):
+            count = int(n_dk[d, k])
+            if count > max_count:
+                max_count = count
+        max_count += 1
+
+        # Build histogram for topic k
+        count_hist = np.zeros(max_count, dtype=np.int32)
+        for d in range(n_docs):
+            count = int(n_dk[d, k])
+            count_hist[count] += 1
+
+        # Compute numerator using recurrence relation
+        numer = 0.0
+        current_digamma_diff = 0.0
+        for count in range(1, max_count):
+            current_digamma_diff += 1.0 / (alpha[k] + count - 1)
+            numer += count_hist[count] * current_digamma_diff
+
+        # Fixed-point update
+        if numer > 0:
+            alpha[k] = alpha[k] * numer / denom
+
+        # Ensure alpha stays positive
+        if alpha[k] < 1e-10:
+            alpha[k] = 1e-10
+
+
+@jit(nopython=True, cache=True)
 def _inference_iteration_numba(doc_ids, word_ids, topic_assignments, n_dk,
                                 phi, alpha, n_components, random_state):
     """Numba-optimized inference iteration (fixed phi)."""
@@ -126,7 +201,7 @@ def _inference_iteration_numba(doc_ids, word_ids, topic_assignments, n_dk,
 
         # Compute probabilities
         for k in range(n_components):
-            p[k] = (n_dk[d, k] + alpha) * phi[k, w]
+            p[k] = (n_dk[d, k] + alpha[k]) * phi[k, w]
 
         # Normalize
         p_sum = 0.0
@@ -160,7 +235,7 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
 
     doc_topic_prior : float, default=None
         Prior of document topic distribution `theta`. If None, defaults to
-        `1 / n_components`.
+        `1 / n_components`. This is the initial value if optimization is enabled.
 
     topic_word_prior : float, default=None
         Prior of topic word distribution `beta`. If None, defaults to
@@ -187,6 +262,13 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
     n_samples : int, default=10
         Number of samples to average for final estimates.
 
+    optimize_doc_topic_prior : bool, default=True
+        Whether to optimize the document-topic prior (alpha) during training.
+        Uses fixed-point iteration with digamma functions.
+
+    doc_topic_prior_optimize_interval : int, default=10
+        Optimize alpha every this many iterations (after burn-in).
+
     Attributes
     ----------
     components_ : ndarray of shape (n_components, n_features)
@@ -202,8 +284,9 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
     bound_ : float
         Final perplexity value.
 
-    doc_topic_prior_ : float
-        Effective document-topic prior (alpha).
+    doc_topic_prior_ : ndarray of shape (n_components,)
+        Effective document-topic prior vector (alpha). Learned if
+        optimize_doc_topic_prior is True.
 
     topic_word_prior_ : float
         Effective topic-word prior (beta).
@@ -221,6 +304,8 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
         burn_in=50,
         sample_every=5,
         n_samples=10,
+        optimize_doc_topic_prior=True,
+        doc_topic_prior_optimize_interval=10,
     ):
         self.n_components = n_components
         self.doc_topic_prior = doc_topic_prior
@@ -232,6 +317,8 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
         self.burn_in = burn_in
         self.sample_every = sample_every
         self.n_samples = n_samples
+        self.optimize_doc_topic_prior = optimize_doc_topic_prior
+        self.doc_topic_prior_optimize_interval = doc_topic_prior_optimize_interval
 
     def _expand_sparse_to_word_sequence(self, X):
         """Convert document-word matrix to word-level arrays.
@@ -279,12 +366,15 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
             Vocabulary size.
         """
         self.n_features_in_ = n_features
+        self._n_docs = n_docs
 
         # Set default priors if not specified
+        # Alpha is now a vector of shape (n_components,)
         if self.doc_topic_prior is None:
-            self.doc_topic_prior_ = 1.0 / self.n_components
+            init_alpha = 1.0 / self.n_components
         else:
-            self.doc_topic_prior_ = self.doc_topic_prior
+            init_alpha = self.doc_topic_prior
+        self.doc_topic_prior_ = np.full(self.n_components, init_alpha, dtype=np.float64)
 
         if self.topic_word_prior is None:
             self.topic_word_prior_ = 1.0 / self.n_components
@@ -348,6 +438,17 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
             avg_n_kw = np.mean(self._n_kw_samples, axis=0)
             self.components_ = avg_n_kw + self.topic_word_prior_
 
+    def _optimize_alpha(self):
+        """Optimize the document-topic prior (alpha) using fixed-point iteration.
+
+        Uses the histogram-based method from Wallach (2008) and Mallet,
+        exploiting the digamma recurrence relation:
+            ψ(x + n) - ψ(x) = Σ_{i=0}^{n-1} 1/(x + i)
+
+        This avoids expensive digamma calls by using count histograms.
+        """
+        _optimize_alpha_numba(self._n_dk, self.doc_topic_prior_, self.n_components)
+
     def fit(self, X, y=None):
         """Fit the model with X using Gibbs sampling.
 
@@ -388,6 +489,14 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
 
             if self.verbose and (iteration + 1) % 10 == 0:
                 print(f"Iteration {iteration + 1}/{self.max_iter}")
+
+            # Optimize alpha after burn-in
+            if (self.optimize_doc_topic_prior and
+                iteration >= self.burn_in and
+                (iteration - self.burn_in) % self.doc_topic_prior_optimize_interval == 0):
+                self._optimize_alpha()
+                if self.verbose >= 2:
+                    print(f"  Alpha sum: {self.doc_topic_prior_.sum():.4f}")
 
             # Collect samples after burn-in
             if iteration >= self.burn_in and samples_collected < self.n_samples:
@@ -463,7 +572,7 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
         # phi[k, w] = components_[k, w] / sum_w'(components_[k, w'])
         phi = np.ascontiguousarray(self.components_ / self.components_.sum(axis=1, keepdims=True))
 
-        alpha = self.doc_topic_prior_
+        alpha = np.ascontiguousarray(self.doc_topic_prior_)
 
         # Run inference Gibbs sampling
         for iteration in range(max_iter):
