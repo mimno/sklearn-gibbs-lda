@@ -27,7 +27,7 @@ except ImportError:
 @jit(nopython=True, cache=True)
 def _gibbs_iteration_numba(doc_ids, word_ids, topic_assignments, n_dk, n_kw, n_k,
                            alpha, beta, beta_V, n_components, random_state):
-    """Numba-optimized Gibbs sampling iteration.
+    """Numba-optimized Gibbs sampling iteration (standard O(K) per token).
 
     Parameters
     ----------
@@ -94,6 +94,216 @@ def _gibbs_iteration_numba(doc_ids, word_ids, topic_assignments, n_dk, n_kw, n_k
         n_dk[d, k_new] += 1
         n_kw[k_new, w] += 1
         n_k[k_new] += 1
+
+
+@jit(nopython=True, cache=True)
+def _build_sparse_word_topics(n_kw, n_components, n_vocab):
+    """Build sparse index structure for topic-word counts.
+
+    Returns:
+        word_topic_indices: (n_vocab, n_components) - topic indices for each word
+        word_topic_count: (n_vocab,) - number of non-zero topics per word
+        topic_idx_in_word: (n_components, n_vocab) - position of topic k in word w's list (-1 if not present)
+    """
+    word_topic_indices = np.zeros((n_vocab, n_components), dtype=np.int32)
+    word_topic_count = np.zeros(n_vocab, dtype=np.int32)
+    topic_idx_in_word = np.full((n_components, n_vocab), -1, dtype=np.int32)
+
+    for w in range(n_vocab):
+        count = 0
+        for k in range(n_components):
+            if n_kw[k, w] > 0:
+                word_topic_indices[w, count] = k
+                topic_idx_in_word[k, w] = count
+                count += 1
+        word_topic_count[w] = count
+
+    return word_topic_indices, word_topic_count, topic_idx_in_word
+
+
+@jit(nopython=True, cache=True)
+def _build_sparse_doc_topics(n_dk, n_components, n_docs):
+    """Build sparse index structure for doc-topic counts.
+
+    Returns:
+        doc_topic_indices: (n_docs, n_components) - topic indices for each doc
+        doc_topic_count: (n_docs,) - number of non-zero topics per doc
+        topic_idx_in_doc: (n_components, n_docs) - position of topic k in doc d's list (-1 if not present)
+    """
+    doc_topic_indices = np.zeros((n_docs, n_components), dtype=np.int32)
+    doc_topic_count = np.zeros(n_docs, dtype=np.int32)
+    topic_idx_in_doc = np.full((n_components, n_docs), -1, dtype=np.int32)
+
+    for d in range(n_docs):
+        count = 0
+        for k in range(n_components):
+            if n_dk[d, k] > 0:
+                doc_topic_indices[d, count] = k
+                topic_idx_in_doc[k, d] = count
+                count += 1
+        doc_topic_count[d] = count
+
+    return doc_topic_indices, doc_topic_count, topic_idx_in_doc
+
+
+@jit(nopython=True, cache=True)
+def _sparse_gibbs_iteration_numba(doc_ids, word_ids, topic_assignments, n_dk, n_kw, n_k,
+                                   alpha, beta, beta_V, n_components, random_state,
+                                   word_topic_indices, word_topic_count, topic_idx_in_word,
+                                   doc_topic_indices, doc_topic_count, topic_idx_in_doc):
+    """SparseLDA-optimized Gibbs sampling iteration (sub-linear per token).
+
+    Uses the three-bucket decomposition from Yao, Mimno, McCallum (KDD 2009):
+    "Efficient Methods for Topic Model Inference on Streaming Document Collections"
+
+    p(z=k) ∝ (n_dk + α_k) × (n_kw + β) / (n_k + Vβ)
+
+    Decomposes into:
+        s_k = α_k × β / (n_k + Vβ)              [smoothing - all K topics]
+        r_k = n_dk × β / (n_k + Vβ)             [doc-topic - sparse]
+        q_k = (n_dk + α_k) × n_kw / (n_k + Vβ)  [topic-word - sparse]
+
+    Sampling is O(K_d + K_w) instead of O(K), where K_d and K_w are the number
+    of non-zero topics in the document and word respectively.
+    """
+    np.random.seed(random_state)
+    n_tokens = len(doc_ids)
+
+    # Precompute denominators: 1 / (n_k + Vβ)
+    denom = np.zeros(n_components)
+    for k in range(n_components):
+        denom[k] = 1.0 / (n_k[k] + beta_V)
+
+    # Precompute and cache s_k = α_k × β / (n_k + Vβ) for all topics
+    s_vals = np.zeros(n_components)
+    s_sum = 0.0
+    for k in range(n_components):
+        s_vals[k] = alpha[k] * beta * denom[k]
+        s_sum += s_vals[k]
+
+    # Temporary arrays for sparse buckets
+    r_vals = np.zeros(n_components)
+    q_vals = np.zeros(n_components)
+
+    for i in range(n_tokens):
+        d = doc_ids[i]
+        w = word_ids[i]
+        k_old = topic_assignments[i]
+
+        # Update smoothing sum for old topic (before decrement)
+        s_sum -= s_vals[k_old]
+
+        # Decrement counts
+        n_dk[d, k_old] -= 1
+        n_kw[k_old, w] -= 1
+        n_k[k_old] -= 1
+
+        # Update denominator and s_vals for old topic (after decrement)
+        denom[k_old] = 1.0 / (n_k[k_old] + beta_V)
+        s_vals[k_old] = alpha[k_old] * beta * denom[k_old]
+        s_sum += s_vals[k_old]
+
+        # Remove k_old from word's sparse list if count became zero
+        if n_kw[k_old, w] == 0:
+            idx = topic_idx_in_word[k_old, w]
+            if idx >= 0:
+                last_idx = word_topic_count[w] - 1
+                if idx < last_idx:
+                    last_topic = word_topic_indices[w, last_idx]
+                    word_topic_indices[w, idx] = last_topic
+                    topic_idx_in_word[last_topic, w] = idx
+                word_topic_count[w] -= 1
+                topic_idx_in_word[k_old, w] = -1
+
+        # Remove k_old from doc's sparse list if count became zero
+        if n_dk[d, k_old] == 0:
+            idx = topic_idx_in_doc[k_old, d]
+            if idx >= 0:
+                last_idx = doc_topic_count[d] - 1
+                if idx < last_idx:
+                    last_topic = doc_topic_indices[d, last_idx]
+                    doc_topic_indices[d, idx] = last_topic
+                    topic_idx_in_doc[last_topic, d] = idx
+                doc_topic_count[d] -= 1
+                topic_idx_in_doc[k_old, d] = -1
+
+        # Compute doc-topic bucket using SPARSE doc-topic indices
+        r_sum = 0.0
+        n_d_topics = doc_topic_count[d]
+        for j in range(n_d_topics):
+            k = doc_topic_indices[d, j]
+            r_vals[j] = n_dk[d, k] * beta * denom[k]
+            r_sum += r_vals[j]
+
+        # Compute topic-word bucket using SPARSE word-topic indices
+        # Store q values to avoid recomputation during sampling
+        q_sum = 0.0
+        n_w_topics = word_topic_count[w]
+        for j in range(n_w_topics):
+            k = word_topic_indices[w, j]
+            q_vals[j] = (n_dk[d, k] + alpha[k]) * n_kw[k, w] * denom[k]
+            q_sum += q_vals[j]
+
+        total = s_sum + r_sum + q_sum
+        u = np.random.random() * total
+
+        k_new = 0
+
+        if u < s_sum:
+            # Sample from smoothing bucket using cached s_vals
+            cumsum = 0.0
+            for k in range(n_components):
+                cumsum += s_vals[k]
+                if u < cumsum:
+                    k_new = k
+                    break
+        elif u < s_sum + r_sum:
+            # Sample from doc-topic bucket (sparse - only n_d_topics topics)
+            u -= s_sum
+            cumsum = 0.0
+            for j in range(n_d_topics):
+                cumsum += r_vals[j]
+                if u < cumsum:
+                    k_new = doc_topic_indices[d, j]
+                    break
+        else:
+            # Sample from topic-word bucket (sparse - only n_w_topics topics)
+            # Use cached q_vals
+            u -= s_sum + r_sum
+            cumsum = 0.0
+            for j in range(n_w_topics):
+                cumsum += q_vals[j]
+                if u < cumsum:
+                    k_new = word_topic_indices[w, j]
+                    break
+
+        # Update smoothing sum for new topic (before increment)
+        s_sum -= s_vals[k_new]
+
+        # Increment counts
+        topic_assignments[i] = k_new
+        n_dk[d, k_new] += 1
+        n_kw[k_new, w] += 1
+        n_k[k_new] += 1
+
+        # Add k_new to word's sparse list if it's new
+        if topic_idx_in_word[k_new, w] < 0:
+            idx = word_topic_count[w]
+            word_topic_indices[w, idx] = k_new
+            topic_idx_in_word[k_new, w] = idx
+            word_topic_count[w] += 1
+
+        # Add k_new to doc's sparse list if it's new
+        if topic_idx_in_doc[k_new, d] < 0:
+            idx = doc_topic_count[d]
+            doc_topic_indices[d, idx] = k_new
+            topic_idx_in_doc[k_new, d] = idx
+            doc_topic_count[d] += 1
+
+        # Update denominator and s_vals for new topic (after increment)
+        denom[k_new] = 1.0 / (n_k[k_new] + beta_V)
+        s_vals[k_new] = alpha[k_new] * beta * denom[k_new]
+        s_sum += s_vals[k_new]
 
 
 @jit(nopython=True, cache=True)
@@ -269,6 +479,11 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
     doc_topic_prior_optimize_interval : int, default=10
         Optimize alpha every this many iterations (after burn-in).
 
+    use_sparse_lda : bool, default=True
+        Whether to use SparseLDA optimization for sub-linear sampling.
+        Uses three-bucket decomposition from Yao, Mimno, McCallum (KDD 2009).
+        Sampling becomes O(K_d + K_w) instead of O(K) per token.
+
     Attributes
     ----------
     components_ : ndarray of shape (n_components, n_features)
@@ -306,6 +521,7 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
         n_samples=10,
         optimize_doc_topic_prior=True,
         doc_topic_prior_optimize_interval=10,
+        use_sparse_lda=True,
     ):
         self.n_components = n_components
         self.doc_topic_prior = doc_topic_prior
@@ -319,6 +535,7 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
         self.n_samples = n_samples
         self.optimize_doc_topic_prior = optimize_doc_topic_prior
         self.doc_topic_prior_optimize_interval = doc_topic_prior_optimize_interval
+        self.use_sparse_lda = use_sparse_lda
 
     def _expand_sparse_to_word_sequence(self, X):
         """Convert document-word matrix to word-level arrays.
@@ -386,6 +603,17 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
         self._n_kw = np.zeros((self.n_components, n_features), dtype=np.float64)
         self._n_k = np.zeros(self.n_components, dtype=np.float64)
 
+        # Initialize sparse index structures for SparseLDA
+        # Word-topic indices
+        self._word_topic_indices = np.zeros((n_features, self.n_components), dtype=np.int32)
+        self._word_topic_count = np.zeros(n_features, dtype=np.int32)
+        self._topic_idx_in_word = np.full((self.n_components, n_features), -1, dtype=np.int32)
+
+        # Doc-topic indices
+        self._doc_topic_indices = np.zeros((n_docs, self.n_components), dtype=np.int32)
+        self._doc_topic_count = np.zeros(n_docs, dtype=np.int32)
+        self._topic_idx_in_doc = np.full((self.n_components, n_docs), -1, dtype=np.int32)
+
         # Sample accumulation
         self._n_kw_samples = []
 
@@ -406,6 +634,13 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
             self._n_dk, self._n_kw, self._n_k
         )
 
+        # Build sparse index structures for SparseLDA
+        if self.use_sparse_lda:
+            self._word_topic_indices, self._word_topic_count, self._topic_idx_in_word = \
+                _build_sparse_word_topics(self._n_kw, self.n_components, self.n_features_in_)
+            self._doc_topic_indices, self._doc_topic_count, self._topic_idx_in_doc = \
+                _build_sparse_doc_topics(self._n_dk, self.n_components, self._n_docs)
+
     def _gibbs_iteration(self, rng):
         """Perform one Gibbs sampling sweep through all word tokens.
 
@@ -422,11 +657,20 @@ class GibbsLDA(TransformerMixin, BaseEstimator):
         # Generate a random seed for this iteration
         iteration_seed = rng.randint(0, 2**31 - 1)
 
-        _gibbs_iteration_numba(
-            self._doc_ids, self._word_ids, self._topic_assignments,
-            self._n_dk, self._n_kw, self._n_k,
-            alpha, beta, beta_V, self.n_components, iteration_seed
-        )
+        if self.use_sparse_lda:
+            _sparse_gibbs_iteration_numba(
+                self._doc_ids, self._word_ids, self._topic_assignments,
+                self._n_dk, self._n_kw, self._n_k,
+                alpha, beta, beta_V, self.n_components, iteration_seed,
+                self._word_topic_indices, self._word_topic_count, self._topic_idx_in_word,
+                self._doc_topic_indices, self._doc_topic_count, self._topic_idx_in_doc
+            )
+        else:
+            _gibbs_iteration_numba(
+                self._doc_ids, self._word_ids, self._topic_assignments,
+                self._n_dk, self._n_kw, self._n_k,
+                alpha, beta, beta_V, self.n_components, iteration_seed
+            )
 
     def _compute_components(self):
         """Average collected samples into components_."""
