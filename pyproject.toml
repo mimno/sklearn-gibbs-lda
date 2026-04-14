@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sklearn-gibbs-lda"
+version = "0.1.0"
+description = "sklearn-compatible LDA using collapsed Gibbs sampling"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "numba",
+]
+
+[tool.setuptools]
+py-modules = ["gibbs_lda"]
